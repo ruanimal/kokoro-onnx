@@ -49,7 +49,43 @@ class Kokoro:
             providers = [env_provider]
 
         log.debug(f"Providers: {providers}")
-        self.sess = rt.InferenceSession(model_path, providers=providers)
+
+        # Build provider options for OpenVINO
+        provider_options = None
+        if any("OpenVINO" in p for p in providers):
+            ov_device = os.getenv("OPENVINO_DEVICE", "CPU")
+            ov_options = {
+                "device_type": ov_device,
+                "disable_dynamic_shapes": "false",
+            }
+            cache_dir = os.getenv("OPENVINO_CACHE_DIR", "")
+            if cache_dir:
+                ov_options["cache_dir"] = cache_dir
+            provider_options = [
+                ov_options if "OpenVINO" in p else {}
+                for p in providers
+            ]
+
+        try:
+            self.sess = rt.InferenceSession(
+                model_path,
+                providers=providers,
+                provider_options=provider_options,
+            )
+        except Exception as e:
+            err_str = str(e).lower()
+            if "openvino" in err_str or "dynamic" in err_str:
+                # OpenVINO cannot handle STFT dynamic rank in Kokoro model.
+                # Fallback: GPU → CPU (all via OpenVINO fail), use CPUExecutionProvider.
+                log.warning(
+                    f"OpenVINO failed to load model (STFT dynamic rank). "
+                    f"Falling back to CPUExecutionProvider. Error: {e}"
+                )
+                providers = ["CPUExecutionProvider"]
+                self.sess = rt.InferenceSession(model_path, providers=providers)
+            else:
+                raise
+
         self.voices: np.ndarray = np.load(voices_path)
 
         vocab = self._load_vocab(vocab_config)

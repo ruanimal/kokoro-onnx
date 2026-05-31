@@ -2,6 +2,7 @@
 # requires-python = ">=3.12"
 # dependencies = [
 #     "kokoro==0.8.4",
+#     "torch>=2.0.0,<2.6.0",
 #     "onnx==1.17.0",
 #     "onnxruntime==1.20.1",
 #     "sounddevice==0.5.1",
@@ -13,10 +14,12 @@
 From https://github.com/hexgrad/kokoro/blob/3f9dd88d6f739b98a86aea608e238621f5b40add/examples/export.py
 
 mkdir checkpoints
+wget https://huggingface.co/hexgrad/Kokoro-82M/resolve/main/config.json -O checkpoints/config.json
+wget https://huggingface.co/hexgrad/Kokoro-82M/resolve/main/kokoro-v1_0.pth -O checkpoints/kokoro-v1_0.pth
 wget https://huggingface.co/hexgrad/Kokoro-82M-v1.1-zh/resolve/main/config.json -O checkpoints/config.json
 wget https://huggingface.co/hexgrad/Kokoro-82M-v1.1-zh/resolve/main/kokoro-v1_1-zh.pth -O checkpoints/kokoro-v1_1-zh.pth
-uv run examples/export.py
-uv run examples/export.py --config_file checkpoints/config.json --checkpoint_path checkpoints/kokoro-v1_1-zh.pth
+uv run scripts/export.py -o onnx_output --opset 14
+uv run scripts/export.py --config_file checkpoints/config.json --checkpoint_path checkpoints/kokoro-v1_1-zh.pth
 """
 
 import argparse
@@ -30,7 +33,7 @@ from kokoro import KModel, KPipeline
 from kokoro.model import KModelForONNX
 
 
-def export_onnx(model, output):
+def export_onnx(model, output, opset_version=17):
     onnx_file = output + "/" + "kokoro.onnx"
 
     input_ids = torch.randint(1, 100, (48,)).numpy()
@@ -38,6 +41,9 @@ def export_onnx(model, output):
     style = torch.randn(1, 256)
     speed = torch.randint(1, 10, (1,)).int()
 
+    # Use lower opset (14) for OpenVINO compatibility:
+    # - opset < 17 avoids native STFT ONNX op (dynamic rank, OpenVINO incompatible)
+    # - With disable_complex=True, CustomSTFT uses Conv1d/ConvTranspose1d (fully static)
     torch.onnx.export(
         model,
         args=(input_ids, style, speed),
@@ -46,7 +52,7 @@ def export_onnx(model, output):
         verbose=True,
         input_names=["input_ids", "style", "speed"],
         output_names=["waveform", "duration"],
-        opset_version=17,
+        opset_version=opset_version,
         dynamic_axes={
             "input_ids": {1: "input_ids_len"},
             "waveform": {0: "num_samples"},
@@ -169,6 +175,12 @@ if __name__ == "__main__":
     parser.add_argument(
         "--output_dir", "-o", type=str, default="onnx", help="output directory"
     )
+    parser.add_argument(
+        "--opset",
+        type=int,
+        default=14,
+        help="ONNX opset version. Use 14 for OpenVINO compatibility (avoids native STFT op). Use 17+ for latest features.",
+    )
 
     args = parser.parse_args()
 
@@ -188,4 +200,4 @@ if __name__ == "__main__":
     elif args.check:
         check_model(model)
     else:
-        export_onnx(model, output_dir)
+        export_onnx(model, output_dir, opset_version=args.opset)
