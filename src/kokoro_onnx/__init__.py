@@ -66,9 +66,16 @@ class Kokoro:
                 for p in providers
             ]
 
+        # Configure SessionOptions for DirectML
+        sess_options = rt.SessionOptions()
+        if any("Dml" in p for p in providers):
+            sess_options.enable_mem_pattern = False
+            sess_options.execution_mode = rt.ExecutionMode.ORT_SEQUENTIAL
+
         try:
             self.sess = rt.InferenceSession(
                 model_path,
+                sess_options=sess_options,
                 providers=providers,
                 provider_options=provider_options,
             )
