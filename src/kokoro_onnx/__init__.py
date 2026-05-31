@@ -8,6 +8,7 @@ import platform
 import re
 import time
 from collections.abc import AsyncGenerator
+from typing import overload
 
 import numpy as np
 import onnxruntime as rt
@@ -92,7 +93,7 @@ class Kokoro:
 
     def _create_audio(
         self, phonemes: str, voice: NDArray[np.float32], speed: float
-    ) -> tuple[NDArray[np.float32], int]:
+    ) -> tuple[NDArray[np.float32], int, NDArray[np.int64] | None]:
         log.debug(f"Phonemes: {phonemes}")
         if len(phonemes) > MAX_PHONEME_LENGTH:
             log.warning(
@@ -121,14 +122,16 @@ class Kokoro:
                 "speed": np.ones(1, dtype=np.float32) * speed,
             }
 
-        audio = self.sess.run(None, inputs)[0]
+        outputs = self.sess.run(None, inputs)
+        audio = outputs[0]
+        duration = outputs[1] if len(outputs) > 1 else None
         audio_duration = len(audio) / SAMPLE_RATE
         create_duration = time.time() - start_t
         rtf = create_duration / audio_duration
         log.debug(
             f"Created audio in length of {audio_duration:.2f}s for {len(phonemes)} phonemes in {create_duration:.2f}s (RTF: {rtf:.2f}"
         )
-        return audio, SAMPLE_RATE
+        return audio, SAMPLE_RATE, duration
 
     def get_voice_style(self, name: str) -> NDArray[np.float32]:
         return self.voices[name]
@@ -167,6 +170,32 @@ class Kokoro:
 
         return batched_phoenemes
 
+    @overload
+    def create(
+        self,
+        text: str,
+        voice: str | NDArray[np.float32],
+        speed: float = ...,
+        lang: str = ...,
+        is_phonemes: bool = ...,
+        trim: bool = ...,
+        *,
+        with_duration: True,
+    ) -> tuple[NDArray[np.float32], int, NDArray[np.int64] | None]: ...
+
+    @overload
+    def create(
+        self,
+        text: str,
+        voice: str | NDArray[np.float32],
+        speed: float = ...,
+        lang: str = ...,
+        is_phonemes: bool = ...,
+        trim: bool = ...,
+        *,
+        with_duration: False = ...,
+    ) -> tuple[NDArray[np.float32], int]: ...
+
     def create(
         self,
         text: str,
@@ -175,9 +204,20 @@ class Kokoro:
         lang: str = "en-us",
         is_phonemes: bool = False,
         trim: bool = True,
-    ) -> tuple[NDArray[np.float32], int]:
+        with_duration: bool = False,
+    ) -> tuple[NDArray[np.float32], int] | tuple[NDArray[np.float32], int, NDArray[np.int64] | None]:
         """
         Create audio from text using the specified voice and speed.
+
+        Args:
+            text: Text or phonemes to generate audio from.
+            voice: Voice name (str) or voice style array.
+            speed: Speech speed, between 0.5 and 2.0.
+            lang: Language code for phonemization (ignored if is_phonemes=True).
+            is_phonemes: If True, treat text as pre-phonemized input.
+            trim: Whether to trim leading/trailing silence.
+            with_duration: If True, return a 3-tuple with per-token duration array.
+                           If False (default), return a 2-tuple for backward compatibility.
         """
         assert speed >= 0.5 and speed <= 2.0, "Speed should be between 0.5 and 2.0"
 
@@ -194,19 +234,51 @@ class Kokoro:
         batched_phoenemes = self._split_phonemes(phonemes)
 
         audio = []
+        durations = []
         log.debug(
             f"Creating audio for {len(batched_phoenemes)} batches for {len(phonemes)} phonemes"
         )
         for phonemes in batched_phoenemes:
-            audio_part, _ = self._create_audio(phonemes, voice, speed)
+            audio_part, _, duration_part = self._create_audio(phonemes, voice, speed)
             if trim:
                 # Trim leading and trailing silence for a more natural sound concatenation
                 # (initial ~2s, subsequent ~0.02s)
                 audio_part, _ = trim_audio(audio_part)
             audio.append(audio_part)
+            if duration_part is not None:
+                durations.append(duration_part)
         audio = np.concatenate(audio)
+        duration = np.concatenate(durations) if durations else None
         log.debug(f"Created audio in {time.time() - start_t:.2f}s")
+        if with_duration:
+            return audio, SAMPLE_RATE, duration
         return audio, SAMPLE_RATE
+
+    @overload
+    def create_stream(
+        self,
+        text: str,
+        voice: str | NDArray[np.float32],
+        speed: float = ...,
+        lang: str = ...,
+        is_phonemes: bool = ...,
+        trim: bool = ...,
+        *,
+        with_duration: True,
+    ) -> AsyncGenerator[tuple[NDArray[np.float32], int, NDArray[np.int64] | None], None]: ...
+
+    @overload
+    def create_stream(
+        self,
+        text: str,
+        voice: str | NDArray[np.float32],
+        speed: float = ...,
+        lang: str = ...,
+        is_phonemes: bool = ...,
+        trim: bool = ...,
+        *,
+        with_duration: False = ...,
+    ) -> AsyncGenerator[tuple[NDArray[np.float32], int], None]: ...
 
     async def create_stream(
         self,
@@ -216,9 +288,20 @@ class Kokoro:
         lang: str = "en-us",
         is_phonemes: bool = False,
         trim: bool = True,
-    ) -> AsyncGenerator[tuple[NDArray[np.float32], int], None]:
+        with_duration: bool = False,
+    ) -> AsyncGenerator[tuple[NDArray[np.float32], int] | tuple[NDArray[np.float32], int, NDArray[np.int64] | None], None]:
         """
         Stream audio creation asynchronously in the background, yielding chunks as they are processed.
+
+        Args:
+            text: Text or phonemes to generate audio from.
+            voice: Voice name (str) or voice style array.
+            speed: Speech speed, between 0.5 and 2.0.
+            lang: Language code for phonemization (ignored if is_phonemes=True).
+            is_phonemes: If True, treat text as pre-phonemized input.
+            trim: Whether to trim leading/trailing silence.
+            with_duration: If True, yield 3-tuples with per-token duration array.
+                           If False (default), yield 2-tuples for backward compatibility.
         """
         assert speed >= 0.5 and speed <= 2.0, "Speed should be between 0.5 and 2.0"
 
@@ -232,14 +315,14 @@ class Kokoro:
             phonemes = self.tokenizer.phonemize(text, lang)
 
         batched_phonemes = self._split_phonemes(phonemes)
-        queue: asyncio.Queue[tuple[NDArray[np.float32], int] | None] = asyncio.Queue()
+        queue: asyncio.Queue[tuple[NDArray[np.float32], int] | tuple[NDArray[np.float32], int, NDArray[np.int64] | None] | None] = asyncio.Queue()
 
         async def process_batches():
             """Process phoneme batches in the background."""
             for i, phonemes in enumerate(batched_phonemes):
                 loop = asyncio.get_event_loop()
                 # Execute in separate thread since it's blocking operation
-                audio_part, sample_rate = await loop.run_in_executor(
+                audio_part, sample_rate, duration_part = await loop.run_in_executor(
                     None, self._create_audio, phonemes, voice, speed
                 )
                 if trim:
@@ -247,7 +330,10 @@ class Kokoro:
                     # (initial ~2s, subsequent ~0.02s)
                     audio_part, _ = trim_audio(audio_part)
                 log.debug(f"Processed chunk {i} of stream")
-                await queue.put((audio_part, sample_rate))
+                if with_duration:
+                    await queue.put((audio_part, sample_rate, duration_part))
+                else:
+                    await queue.put((audio_part, sample_rate))
             await queue.put(None)  # Signal the end of the stream
 
         # Start processing in the background
